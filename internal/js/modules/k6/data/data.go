@@ -118,25 +118,32 @@ func (d *Data) NewSharedArrayFrom(rt *sobek.Runtime, name string, r RecordReader
 		common.Throw(rt, errors.New("empty name provided to SharedArray's constructor"))
 	}
 
-	var arr []string
-	for {
-		record, err := r.Read()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			common.Throw(rt, fmt.Errorf("failed to read record; reason: %w", err))
+	array, err := d.shared.getOrCreate(name, func() (sharedArray, error) {
+		var arr []string
+		for {
+			record, readErr := r.Read()
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			if readErr != nil {
+				return sharedArray{}, fmt.Errorf("failed to read record; reason: %w", readErr)
+			}
+
+			marshaled, marshalErr := json.Marshal(record)
+			if marshalErr != nil {
+				return sharedArray{}, fmt.Errorf("failed to marshal record; reason: %w", marshalErr)
+			}
+
+			arr = append(arr, string(marshaled))
 		}
 
-		marshaled, err := json.Marshal(record)
-		if err != nil {
-			common.Throw(rt, fmt.Errorf("failed to marshal record; reason: %w", err))
-		}
-
-		arr = append(arr, string(marshaled))
+		return sharedArray{arr: arr}, nil
+	})
+	if err != nil {
+		common.Throw(rt, err)
 	}
 
-	return d.shared.set(name, arr).wrap(rt).ToObject(rt)
+	return array.wrap(rt).ToObject(rt)
 }
 
 // set is a helper method to set a shared array in the underlying shared arrays map.
@@ -164,6 +171,30 @@ func (s *sharedArrays) get(rt *sobek.Runtime, name string, call sobek.Callable) 
 	}
 
 	return array
+}
+
+func (s *sharedArrays) getOrCreate(name string, builder func() (sharedArray, error)) (sharedArray, error) {
+	s.mu.RLock()
+	array, ok := s.data[name]
+	s.mu.RUnlock()
+	if ok {
+		return array, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if array, ok = s.data[name]; ok {
+		return array, nil
+	}
+
+	array, err := builder()
+	if err != nil {
+		return sharedArray{}, err
+	}
+
+	s.data[name] = array
+	return array, nil
 }
 
 func getShareArrayFromCall(rt *sobek.Runtime, call sobek.Callable) sharedArray {

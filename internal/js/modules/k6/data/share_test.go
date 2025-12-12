@@ -3,7 +3,9 @@ package data
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -214,6 +216,58 @@ func TestSharedArrayAnotherRuntimeWorking(t *testing.T) {
 
 	`)
 	require.NoError(t, err)
+}
+
+type countingRecordReader struct {
+	records []any
+	index   int
+	uses    *atomic.Int64
+}
+
+func (c *countingRecordReader) Read() (any, error) {
+	if c.index == 0 {
+		c.uses.Add(1)
+	}
+
+	if c.index >= len(c.records) {
+		return nil, io.EOF
+	}
+
+	value := c.records[c.index]
+	c.index++
+
+	return value, nil
+}
+
+func TestNewSharedArrayFromReusesExistingArray(t *testing.T) {
+	t.Parallel()
+
+	rt := sobek.New()
+	vu := &modulestest.VU{
+		RuntimeField: rt,
+		InitEnvField: &common.InitEnvironment{},
+	}
+
+	dataModule, ok := New().NewModuleInstance(vu).(*Data)
+	require.True(t, ok)
+
+	const arrayName = "shared-from-csv"
+	var uses atomic.Int64
+
+	reader := func() RecordReader {
+		return &countingRecordReader{
+			records: []any{"a", "b"},
+			uses:    &uses,
+		}
+	}
+
+	first := dataModule.NewSharedArrayFrom(rt, arrayName, reader())
+	require.Equal(t, int64(2), first.Get("length").ToInteger())
+
+	second := dataModule.NewSharedArrayFrom(rt, arrayName, reader())
+	require.Equal(t, int64(2), second.Get("length").ToInteger())
+
+	require.Equal(t, int64(1), uses.Load(), "shared array should be built only once")
 }
 
 func TestSharedArrayRaceInInitialization(t *testing.T) {

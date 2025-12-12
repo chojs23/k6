@@ -2,6 +2,7 @@ package csv
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"testing"
@@ -16,6 +17,8 @@ import (
 	"go.k6.io/k6/internal/js/compiler"
 
 	"github.com/stretchr/testify/require"
+
+	"gopkg.in/guregu/null.v3"
 
 	"go.k6.io/k6/js/modulestest"
 )
@@ -37,6 +40,44 @@ Messiaen,Olivier,Olivier Messiaen,1908,1992,1908–1992
 Bellini,Vincenzo,Vincenzo Bellini,1801,1835,1801–1835
 Ligeti,György,György Ligeti,1923,2006,1923–2006
 `
+
+type stubReadSeekStater struct {
+	size int64
+}
+
+func (s *stubReadSeekStater) Read(_ []byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (s *stubReadSeekStater) Seek(_ int64, _ int) (int64, error) {
+	return 0, nil
+}
+
+func (s *stubReadSeekStater) Stat() *fs.FileInfo {
+	return &fs.FileInfo{Name: "data.csv", Size: s.size}
+}
+
+func TestSharedArrayNameFor(t *testing.T) {
+	t.Parallel()
+
+	file := fs.File{
+		Path:           "/data.csv",
+		ReadSeekStater: &stubReadSeekStater{size: 1024},
+	}
+
+	options := newDefaultParserOptions()
+
+	first := sharedArrayNameFor(file, options)
+	second := sharedArrayNameFor(file, options)
+
+	require.Equal(t, first, second, "shared array name should be deterministic")
+
+	options.Delimiter = ';'
+	require.NotEqual(t, first, sharedArrayNameFor(file, options), "changing options should change the derived name")
+
+	options.SharedArrayName = null.StringFrom("custom-users")
+	require.Equal(t, "custom-users", sharedArrayNameFor(file, options), "explicit sharedArrayName should be honored")
+}
 
 func TestParserConstructor(t *testing.T) {
 	t.Parallel()

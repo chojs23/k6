@@ -2,12 +2,14 @@
 package csv
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
+	"strings"
 	"sync/atomic"
-	"time"
 
 	"go.k6.io/k6/internal/js/modules/k6/data"
 
@@ -123,7 +125,7 @@ func (mi *ModuleInstance) Parse(file sobek.Value, options sobek.Value) *sobek.Pr
 	}
 
 	go func() {
-		underlyingSharedArrayName := parseSharedArrayNamePrefix + strconv.Itoa(time.Now().Nanosecond())
+		underlyingSharedArrayName := sharedArrayNameFor(fileObj, parserOptions)
 
 		// Because we rely on the data module to create the shared array, we need to
 		// make sure that the data module is initialized before we can proceed, and that we don't instantiate
@@ -134,6 +136,36 @@ func (mi *ModuleInstance) Parse(file sobek.Value, options sobek.Value) *sobek.Pr
 	}()
 
 	return promise
+}
+
+func sharedArrayNameFor(file fs.File, opts options) string {
+	if opts.SharedArrayName.Valid {
+		return opts.SharedArrayName.String
+	}
+
+	fileSize := int64(0)
+	if file.ReadSeekStater != nil && file.ReadSeekStater.Stat() != nil {
+		fileSize = file.ReadSeekStater.Stat().Size
+	}
+
+	optionsFingerprint := parserOptionsFingerprint(opts)
+
+	payload, err := json.Marshal(struct {
+		Path    string `json:"path"`
+		Size    int64  `json:"size"`
+		Options string `json:"options"`
+	}{
+		Path:    file.Path,
+		Size:    fileSize,
+		Options: optionsFingerprint,
+	})
+	if err != nil {
+		// The payload only contains primitive types, so this should never happen.
+		panic(fmt.Errorf("failed to derive shared array name: %w", err))
+	}
+
+	hash := sha256.Sum256(payload)
+	return parseSharedArrayNamePrefix + hex.EncodeToString(hash[:])
 }
 
 // NewParser creates a new CSV parser instance.
@@ -257,6 +289,11 @@ type options struct {
 	// should be returned. Same thing applies if the [FromLine] option is set to a value greater
 	// than 0.
 	AsObjects null.Bool `js:"asObjects"`
+
+	// SharedArrayName controls the name of the underlying shared array. When unset, a deterministic
+	// name derived from the file path, size, and parser options is used so that VUs reuse the same
+	// array instead of re-parsing the file.
+	SharedArrayName null.String `js:"sharedArrayName"`
 }
 
 // newDefaultParserOptions creates a new options instance with default values.
@@ -303,9 +340,52 @@ func newParserOptionsFrom(obj *sobek.Object) (options, error) {
 		options.AsObjects = null.BoolFrom(v.ToBoolean())
 	}
 
+	if v := obj.Get("sharedArrayName"); v != nil && !sobek.IsUndefined(v) && !sobek.IsNull(v) {
+		name := strings.TrimSpace(v.String())
+		if name == "" {
+			return options, fmt.Errorf("sharedArrayName, when provided, cannot be empty")
+		}
+		options.SharedArrayName = null.StringFrom(name)
+	}
+
 	if options.FromLine.Valid && options.ToLine.Valid && options.FromLine.Int64 >= options.ToLine.Int64 {
 		return options, fmt.Errorf("fromLine must be less than or equal to toLine")
 	}
 
 	return options, nil
+}
+
+func parserOptionsFingerprint(opts options) string {
+	fp := struct {
+		Delimiter     string `json:"delimiter"`
+		SkipFirstLine bool   `json:"skipFirstLine"`
+		FromLine      *int64 `json:"fromLine,omitempty"`
+		ToLine        *int64 `json:"toLine,omitempty"`
+		AsObjects     *bool  `json:"asObjects,omitempty"`
+	}{
+		Delimiter:     string(opts.Delimiter),
+		SkipFirstLine: opts.SkipFirstLine,
+	}
+
+	if opts.FromLine.Valid {
+		from := opts.FromLine.Int64
+		fp.FromLine = &from
+	}
+
+	if opts.ToLine.Valid {
+		to := opts.ToLine.Int64
+		fp.ToLine = &to
+	}
+
+	if opts.AsObjects.Valid {
+		asObjects := opts.AsObjects.Bool
+		fp.AsObjects = &asObjects
+	}
+
+	encoded, err := json.Marshal(fp)
+	if err != nil {
+		panic(fmt.Errorf("failed to encode parser options fingerprint: %w", err))
+	}
+
+	return string(encoded)
 }
